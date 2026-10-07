@@ -349,6 +349,13 @@ def main():
         with tempfile.TemporaryDirectory(prefix="izsh-launcher-") as install_root:
             os.mkdir(os.path.join(install_root, "bin"))
             os.symlink(ZSH, os.path.join(install_root, "bin", "zsh"))
+            module_dir = os.path.join(install_root, "lib", "zsh", "test-version")
+            site_functions = os.path.join(
+                install_root, "share", "zsh", "site-functions")
+            functions = os.path.join(install_root, "share", "zsh", "functions")
+            os.makedirs(module_dir)
+            os.makedirs(site_functions)
+            os.makedirs(functions)
             launcher_env = dict(os.environ, IZSH_INSTALL_ROOT=install_root)
             for marker in ("launcher-one", "launcher-two"):
                 result = subprocess.run(
@@ -359,9 +366,25 @@ def main():
                 )
                 if result.returncode != 0 or result.stdout != marker.encode():
                     fail("launcher changed ordinary command behavior")
+            resource_result = subprocess.run(
+                [
+                    "/bin/sh", LAUNCHER, "-f", "-c",
+                    "print -r -- $module_path[1]; "
+                    "print -r -- $fpath[1]; print -r -- $fpath[2]",
+                ],
+                env=launcher_env,
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            expected_resources = "%s\n%s\n%s\n" % (
+                module_dir, site_functions, functions)
+            if (resource_result.returncode != 0 or
+                    resource_result.stdout != expected_resources):
+                fail("launcher did not relocate module_path and fpath")
             sessions_root = os.path.join(install_root, "sessions")
             sessions = sorted(os.listdir(sessions_root))
-            if len(sessions) != 2 or sessions[0] == sessions[1]:
+            if len(sessions) != 3 or len(set(sessions)) != 3:
                 fail("launcher did not create one unique directory per session")
             for session_id in sessions:
                 if not re.match(r"^\d{8}T\d{6}Z-[A-Za-z0-9]{6}$", session_id):

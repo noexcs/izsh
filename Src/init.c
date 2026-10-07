@@ -1200,6 +1200,11 @@ setupvals(char *cmd, char *runscript, char *zsh_name)
     mailpath = mkarray(NULL);
     psvar    = mkarray(NULL);
     module_path = mkarray(ztrdup(MODULE_DIR));
+    ptr = getenv("IZSH_MODULE_PATH");
+    if (ptr && *ptr && unset(PRIVILEGED)) {
+	freearray(module_path);
+	module_path = mkarray(ztrdup(ptr));
+    }
     modulestab = newmoduletable(17, "modules");
     linkedmodules = znewlinklist();
 

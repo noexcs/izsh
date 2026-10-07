@@ -9,6 +9,32 @@ if [ ! -x "$IZSH_BINARY" ]; then
     exit 127
 fi
 
+# Resolve runtime resources relative to the installation instead of relying on
+# the prefix that was used to build the binary.
+unset IZSH_MODULE_PATH
+for IZSH_MODULE_CANDIDATE in "$IZSH_INSTALL_ROOT"/lib/zsh/*; do
+    if [ -d "$IZSH_MODULE_CANDIDATE" ]; then
+        IZSH_MODULE_PATH=$IZSH_MODULE_CANDIDATE
+    fi
+done
+if [ -n "${IZSH_MODULE_PATH:-}" ]; then
+    export IZSH_MODULE_PATH
+fi
+
+IZSH_FPATH=""
+for IZSH_FUNCTION_DIR in \
+    "$IZSH_INSTALL_ROOT/share/zsh/site-functions" \
+    "$IZSH_INSTALL_ROOT/share/zsh/functions"
+do
+    if [ -d "$IZSH_FUNCTION_DIR" ]; then
+        IZSH_FPATH="${IZSH_FPATH:+$IZSH_FPATH:}$IZSH_FUNCTION_DIR"
+    fi
+done
+if [ -n "$IZSH_FPATH" ]; then
+    FPATH="$IZSH_FPATH${FPATH:+:$FPATH}"
+    export FPATH
+fi
+
 # A new launcher invocation is a new terminal session.  The timestamp keeps
 # sessions sortable; mktemp supplies the uniqueness needed for concurrent tabs.
 : "${IZSH_SESSION_ROOT:=$IZSH_INSTALL_ROOT/sessions}"
