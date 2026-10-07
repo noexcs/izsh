@@ -228,7 +228,14 @@ loop(int toplevel, int justonce)
 		zleentry(ZLE_CMD_PREEXEC);
 	    if (stopmsg)	/* unset 'you have stopped jobs' flag */
 		stopmsg--;
+	    if (toplevel && izsh_capture_requested()) {
+		char *capture_text = getpermtext(prog, NULL, 0);
+		izsh_begin_command(capture_text);
+		zsfree(capture_text);
+	    }
 	    execode(prog, 0, 0, toplevel ? "toplevel" : "file");
+	    if (toplevel)
+		izsh_finish_command(lastval);
 	    tok = toksav;
 	    if (toplevel) {
 		noexitct = 0;
@@ -1568,7 +1575,10 @@ init_misc(char *cmd, char *zsh_name)
 	    close(SHIN);
 	SHIN = movefd(open("/dev/null", O_RDONLY | O_NOCTTY));
 	shinbufreset();
+	if (izsh_capture_requested())
+	    izsh_begin_command(cmd);
 	execstring(cmd, 0, 1, "cmdarg");
+	izsh_finish_command(lastval);
 	stopmsg = 1;
 	zexit((exit_pending || shell_exiting) ? exit_val : lastval, ZEXIT_NORMAL);
     }
@@ -1948,6 +1958,7 @@ zsh_main(UNUSED(int argc), char **argv)
     init_bltinmods();
     init_builtins();
     run_init_scripts();
+    izsh_start_session();
     setupshin(runscript);
     init_misc(cmd, zsh_name);
 

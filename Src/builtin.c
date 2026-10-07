@@ -5978,6 +5978,8 @@ zexit(int val, enum zexit_t from_where)
      * indicate we shouldn't do any recursive processing.
      */
     shell_exiting = -1;
+    izsh_finish_command(exit_val);
+    izsh_end_session(exit_val);
     /*
      * We want to do all remaining processing regardless of preceding
      * errors, even user interrupts.

@@ -467,6 +467,453 @@ static int nowait, pline_level = 0;
 static int list_pipe_child = 0, list_pipe_job;
 static char list_pipe_text[JOBTEXTSIZE];
 
+/* Optional command telemetry for the izsh prototype.  The shell remains
+ * completely unchanged unless IZSH_EVENTS_FILE is set. */
+struct izsh_capture_state {
+    int active;
+    int events_fd;
+    int stdout_fd;
+    int stderr_fd;
+    unsigned long sequence;
+    struct timespec started;
+    long long started_at_ms;
+    char *command;
+    char *stdout_path;
+    char *stderr_path;
+};
+
+static struct izsh_capture_state izsh_capture;
+static unsigned long izsh_capture_sequence;
+static int izsh_session_started, izsh_session_ended;
+static pid_t izsh_session_pid;
+static char *izsh_session_id;
+static char *izsh_session_dir;
+static char *izsh_session_events_path;
+
+struct izsh_event_buffer {
+    char *data;
+    size_t len;
+    size_t alloc;
+    int failed;
+};
+
+static void addfd(int forked, int *save, struct multio **mfds, int fd1,
+                  int fd2, int rflag, char *varid);
+
+/**/
+int
+izsh_capture_requested(void)
+{
+    char *path = izsh_session_events_path ? izsh_session_events_path :
+        getenv("IZSH_EVENTS_FILE");
+    return path && *path;
+}
+
+static void
+izsh_event_buffer_init(struct izsh_event_buffer *buffer)
+{
+    buffer->alloc = 512;
+    buffer->len = 0;
+    buffer->failed = 0;
+    buffer->data = zalloc(buffer->alloc);
+    buffer->data[0] = '\0';
+}
+
+static int
+izsh_event_buffer_reserve(struct izsh_event_buffer *buffer, size_t extra)
+{
+    size_t needed, next;
+
+    if (buffer->failed)
+        return 0;
+    if (extra > (size_t)-1 - buffer->len - 1) {
+        buffer->failed = 1;
+        return 0;
+    }
+    needed = buffer->len + extra + 1;
+    if (needed <= buffer->alloc)
+	return 1;
+    next = buffer->alloc;
+    while (next < needed && next <= (size_t)-1 / 2)
+        next *= 2;
+    if (next < needed)
+        next = needed;
+    buffer->data = zrealloc(buffer->data, next);
+    buffer->alloc = next;
+    return 1;
+}
+
+static void
+izsh_event_buffer_append(struct izsh_event_buffer *buffer,
+                         const char *value, size_t len)
+{
+    if (!izsh_event_buffer_reserve(buffer, len))
+        return;
+    memcpy(buffer->data + buffer->len, value, len);
+    buffer->len += len;
+    buffer->data[buffer->len] = '\0';
+}
+
+static void
+izsh_event_buffer_append_string(struct izsh_event_buffer *buffer,
+                                const char *value)
+{
+    izsh_event_buffer_append(buffer, value, strlen(value));
+}
+
+static void
+izsh_event_buffer_append_number(struct izsh_event_buffer *buffer,
+                                long long value)
+{
+    char number[64];
+    int len = snprintf(number, sizeof(number), "%lld", value);
+
+    if (len > 0)
+        izsh_event_buffer_append(buffer, number, len);
+}
+
+static void
+izsh_event_buffer_append_json(struct izsh_event_buffer *buffer,
+                              const char *value)
+{
+    const unsigned char *p = (const unsigned char *)(value ? value : "");
+    char escaped[7];
+
+    izsh_event_buffer_append(buffer, "\"", 1);
+    for (; *p; p++) {
+        switch (*p) {
+        case '\\': izsh_event_buffer_append(buffer, "\\\\", 2); break;
+        case '"':  izsh_event_buffer_append(buffer, "\\\"", 2); break;
+        case '\n': izsh_event_buffer_append(buffer, "\\n", 2); break;
+        case '\r': izsh_event_buffer_append(buffer, "\\r", 2); break;
+        case '\t': izsh_event_buffer_append(buffer, "\\t", 2); break;
+        default:
+            if (*p < 0x20) {
+                snprintf(escaped, sizeof(escaped), "\\u%04x", *p);
+                izsh_event_buffer_append(buffer, escaped, 6);
+            } else
+                izsh_event_buffer_append(buffer, (const char *)p, 1);
+            break;
+        }
+    }
+    izsh_event_buffer_append(buffer, "\"", 1);
+}
+
+static void
+izsh_event_buffer_write(int fd, struct izsh_event_buffer *buffer)
+{
+    izsh_event_buffer_append(buffer, "\n", 1);
+    if (!buffer->failed)
+        write_loop(fd, buffer->data, buffer->len);
+    zsfree(buffer->data);
+}
+
+static void
+izsh_event_buffer_append_id(struct izsh_event_buffer *buffer,
+                            unsigned long sequence)
+{
+    char *id;
+    size_t idlen = strlen(izsh_session_id) + 32;
+
+    id = zalloc(idlen);
+    snprintf(id, idlen, "%s:%lu", izsh_session_id, sequence);
+    izsh_event_buffer_append_json(buffer, id);
+    zsfree(id);
+}
+
+static long long
+izsh_realtime_ms(void)
+{
+    struct timespec now;
+
+    zgettime(&now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static long long
+izsh_elapsed_ms(void)
+{
+    struct timespec now;
+    long long sec, nsec;
+
+    zgettime_monotonic_if_available(&now);
+    sec = (long long)now.tv_sec - (long long)izsh_capture.started.tv_sec;
+    nsec = (long long)now.tv_nsec - (long long)izsh_capture.started.tv_nsec;
+    return sec * 1000 + nsec / 1000000;
+}
+
+static void
+izsh_write_start_event(void)
+{
+    struct izsh_event_buffer event;
+
+    izsh_event_buffer_init(&event);
+    izsh_event_buffer_append_string(&event,
+        "{\"type\":\"command_start\",\"session_id\":");
+    izsh_event_buffer_append_json(&event, izsh_session_id);
+    izsh_event_buffer_append_string(&event, ",\"command_id\":");
+    izsh_event_buffer_append_number(&event, izsh_capture.sequence);
+    izsh_event_buffer_append_string(&event, ",\"id\":");
+    izsh_event_buffer_append_id(&event, izsh_capture.sequence);
+    izsh_event_buffer_append_string(&event, ",\"pid\":");
+    izsh_event_buffer_append_number(&event, getpid());
+    izsh_event_buffer_append_string(&event, ",\"tty\":");
+    izsh_event_buffer_append_json(&event, ttystrname ? ttystrname : "");
+    izsh_event_buffer_append_string(&event, ",\"source\":");
+    izsh_event_buffer_append_json(&event,
+        interact && isset(SHINSTDIN) ? "interactive" : "noninteractive");
+    izsh_event_buffer_append_string(&event, ",\"started_at_ms\":");
+    izsh_event_buffer_append_number(&event, izsh_capture.started_at_ms);
+    izsh_event_buffer_append_string(&event, ",\"command\":");
+    izsh_event_buffer_append_json(&event, izsh_capture.command);
+    izsh_event_buffer_append_string(&event, ",\"cwd\":");
+    {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd)))
+            izsh_event_buffer_append_json(&event, cwd);
+        else
+            izsh_event_buffer_append_json(&event, "");
+    }
+    izsh_event_buffer_append_string(&event, ",\"stdout_path\":");
+    izsh_event_buffer_append_json(&event, izsh_capture.stdout_path);
+    izsh_event_buffer_append_string(&event, ",\"stderr_path\":");
+    izsh_event_buffer_append_json(&event, izsh_capture.stderr_path);
+    izsh_event_buffer_append(&event, "}", 1);
+    izsh_event_buffer_write(izsh_capture.events_fd, &event);
+}
+
+static void
+izsh_write_end_event(int status, long long stdout_bytes,
+                     long long stderr_bytes)
+{
+    struct izsh_event_buffer event;
+
+    izsh_event_buffer_init(&event);
+    izsh_event_buffer_append_string(&event,
+        "{\"type\":\"command_end\",\"session_id\":");
+    izsh_event_buffer_append_json(&event, izsh_session_id);
+    izsh_event_buffer_append_string(&event, ",\"command_id\":");
+    izsh_event_buffer_append_number(&event, izsh_capture.sequence);
+    izsh_event_buffer_append_string(&event, ",\"id\":");
+    izsh_event_buffer_append_id(&event, izsh_capture.sequence);
+    izsh_event_buffer_append_string(&event, ",\"finished_at_ms\":");
+    izsh_event_buffer_append_number(&event, izsh_realtime_ms());
+    izsh_event_buffer_append_string(&event, ",\"exit\":");
+    izsh_event_buffer_append_number(&event, status);
+    izsh_event_buffer_append_string(&event, ",\"duration_ms\":");
+    izsh_event_buffer_append_number(&event, izsh_elapsed_ms());
+    izsh_event_buffer_append_string(&event, ",\"stdout_bytes\":");
+    izsh_event_buffer_append_number(&event, stdout_bytes);
+    izsh_event_buffer_append_string(&event, ",\"stderr_bytes\":");
+    izsh_event_buffer_append_number(&event, stderr_bytes);
+    izsh_event_buffer_append_string(&event, ",\"stdout_path\":");
+    izsh_event_buffer_append_json(&event, izsh_capture.stdout_path);
+    izsh_event_buffer_append_string(&event, ",\"stderr_path\":");
+    izsh_event_buffer_append_json(&event, izsh_capture.stderr_path);
+    izsh_event_buffer_append(&event, "}", 1);
+    izsh_event_buffer_write(izsh_capture.events_fd, &event);
+}
+
+/**/
+void
+izsh_finish_command(int status)
+{
+    struct stat stdout_stat, stderr_stat;
+    long long stdout_bytes = -1, stderr_bytes = -1;
+
+    if (!izsh_capture.active)
+        return;
+    if (!fstat(izsh_capture.stdout_fd, &stdout_stat))
+        stdout_bytes = stdout_stat.st_size;
+    if (!fstat(izsh_capture.stderr_fd, &stderr_stat))
+        stderr_bytes = stderr_stat.st_size;
+    zclose(izsh_capture.stdout_fd);
+    zclose(izsh_capture.stderr_fd);
+    izsh_write_end_event(status, stdout_bytes, stderr_bytes);
+    zclose(izsh_capture.events_fd);
+    if (izsh_capture.command)
+        zsfree(izsh_capture.command);
+    if (izsh_capture.stdout_path)
+        zsfree(izsh_capture.stdout_path);
+    if (izsh_capture.stderr_path)
+        zsfree(izsh_capture.stderr_path);
+    memset(&izsh_capture, 0, sizeof(izsh_capture));
+}
+
+/**/
+void
+izsh_begin_command(const char *command)
+{
+    char *events_path = izsh_session_events_path;
+    size_t pathlen;
+    int fd;
+
+    if (izsh_capture.active || !events_path || !*events_path)
+        return;
+    memset(&izsh_capture, 0, sizeof(izsh_capture));
+    izsh_capture.events_fd = izsh_capture.stdout_fd =
+        izsh_capture.stderr_fd = -1;
+    izsh_capture.sequence = ++izsh_capture_sequence;
+    izsh_capture.command = ztrdup(command ? command : "");
+    zgettime_monotonic_if_available(&izsh_capture.started);
+    izsh_capture.started_at_ms = izsh_realtime_ms();
+
+    fd = open(events_path, O_WRONLY | O_CREAT | O_APPEND | O_NOCTTY, 0600);
+    if (fd < 0)
+        goto failed;
+    izsh_capture.events_fd = movefd(fd);
+
+    pathlen = strlen(izsh_session_dir ? izsh_session_dir : events_path) + 64;
+    izsh_capture.stdout_path = zalloc(pathlen);
+    izsh_capture.stderr_path = zalloc(pathlen);
+    if (izsh_session_dir) {
+        snprintf(izsh_capture.stdout_path, pathlen,
+                 "%s/commands/%lu.stdout", izsh_session_dir,
+                 izsh_capture.sequence);
+        snprintf(izsh_capture.stderr_path, pathlen,
+                 "%s/commands/%lu.stderr", izsh_session_dir,
+                 izsh_capture.sequence);
+    } else {
+        snprintf(izsh_capture.stdout_path, pathlen, "%s.%ld.%lu.stdout",
+                 events_path, (long)getpid(), izsh_capture.sequence);
+        snprintf(izsh_capture.stderr_path, pathlen, "%s.%ld.%lu.stderr",
+                 events_path, (long)getpid(), izsh_capture.sequence);
+    }
+    izsh_capture.stdout_fd = movefd(open(izsh_capture.stdout_path,
+                                         O_WRONLY | O_CREAT | O_TRUNC |
+                                         O_APPEND | O_NOCTTY, 0600));
+    izsh_capture.stderr_fd = movefd(open(izsh_capture.stderr_path,
+                                         O_WRONLY | O_CREAT | O_TRUNC |
+                                         O_APPEND | O_NOCTTY, 0600));
+    if (izsh_capture.stdout_fd < 0 || izsh_capture.stderr_fd < 0)
+        goto failed;
+
+    izsh_capture.active = 1;
+    izsh_write_start_event();
+    return;
+
+failed:
+    if (izsh_capture.stdout_fd >= 0)
+        zclose(izsh_capture.stdout_fd);
+    if (izsh_capture.stderr_fd >= 0)
+        zclose(izsh_capture.stderr_fd);
+    if (izsh_capture.events_fd >= 0)
+        zclose(izsh_capture.events_fd);
+    if (izsh_capture.stdout_path)
+        unlink(izsh_capture.stdout_path);
+    if (izsh_capture.stderr_path)
+        unlink(izsh_capture.stderr_path);
+    if (izsh_capture.command)
+        zsfree(izsh_capture.command);
+    if (izsh_capture.stdout_path)
+        zsfree(izsh_capture.stdout_path);
+    if (izsh_capture.stderr_path)
+        zsfree(izsh_capture.stderr_path);
+    memset(&izsh_capture, 0, sizeof(izsh_capture));
+}
+
+static void
+izsh_write_shell_event(const char *type, int status)
+{
+    struct izsh_event_buffer event;
+    int fd;
+
+    fd = open(izsh_session_events_path,
+              O_WRONLY | O_CREAT | O_APPEND | O_NOCTTY, 0600);
+    if (fd < 0)
+        return;
+    fd = movefd(fd);
+    izsh_event_buffer_init(&event);
+    izsh_event_buffer_append_string(&event, "{\"type\":");
+    izsh_event_buffer_append_json(&event, type);
+    izsh_event_buffer_append_string(&event, ",\"session_id\":");
+    izsh_event_buffer_append_json(&event, izsh_session_id);
+    izsh_event_buffer_append_string(&event, ",\"pid\":");
+    izsh_event_buffer_append_number(&event, izsh_session_pid);
+    if (!strcmp(type, "shell_start")) {
+        izsh_event_buffer_append_string(&event, ",\"ppid\":");
+        izsh_event_buffer_append_number(&event, getppid());
+        izsh_event_buffer_append_string(&event, ",\"tty\":");
+        izsh_event_buffer_append_json(&event, ttystrname ? ttystrname : "");
+        izsh_event_buffer_append_string(&event, ",\"started_at_ms\":");
+        izsh_event_buffer_append_number(&event, izsh_realtime_ms());
+    } else {
+        izsh_event_buffer_append_string(&event, ",\"finished_at_ms\":");
+        izsh_event_buffer_append_number(&event, izsh_realtime_ms());
+        izsh_event_buffer_append_string(&event, ",\"exit\":");
+        izsh_event_buffer_append_number(&event, status);
+    }
+    izsh_event_buffer_append(&event, "}", 1);
+    izsh_event_buffer_write(fd, &event);
+    zclose(fd);
+}
+
+/**/
+void
+izsh_start_session(void)
+{
+    char fallback_id[96];
+    char *value;
+
+    if (izsh_session_started || !izsh_capture_requested())
+        return;
+    izsh_session_pid = getpid();
+    value = getenv("IZSH_SESSION_ID");
+    if (!value || !*value) {
+        snprintf(fallback_id, sizeof(fallback_id), "%lld-p%ld",
+                 izsh_realtime_ms(), (long)izsh_session_pid);
+        value = fallback_id;
+    }
+    izsh_session_id = ztrdup(value);
+    value = getenv("IZSH_SESSION_DIR");
+    if (value && *value)
+        izsh_session_dir = ztrdup(value);
+    izsh_session_events_path = ztrdup(getenv("IZSH_EVENTS_FILE"));
+    izsh_session_started = 1;
+    izsh_write_shell_event("shell_start", 0);
+}
+
+/**/
+void
+izsh_end_session(int status)
+{
+    if (!izsh_session_started || izsh_session_ended ||
+        getpid() != izsh_session_pid)
+        return;
+    izsh_session_ended = 1;
+    izsh_write_shell_event("shell_end", status);
+}
+
+static int
+izsh_redirection_targets(LinkList redir, int fd)
+{
+    LinkNode node;
+
+    for (node = redir ? firstnode(redir) : NULL; node; incnode(node))
+        if (((Redir)getdata(node))->fd1 == fd)
+            return 1;
+    return 0;
+}
+
+static void
+izsh_add_stream_capture(int forked, int *save, struct multio **mfds,
+                        int fd, int capture_fd)
+{
+    int terminal_fd, output_fd;
+
+    terminal_fd = movefd(dup(fd));
+    output_fd = movefd(dup(capture_fd));
+    if (terminal_fd < 0 || output_fd < 0) {
+        if (terminal_fd >= 0)
+            zclose(terminal_fd);
+        if (output_fd >= 0)
+            zclose(output_fd);
+        return;
+    }
+    addfd(forked, save, mfds, fd, terminal_fd, 1, NULL);
+    addfd(forked, save, mfds, fd, output_fd, 1, NULL);
+}
+
 /* execute a current shell command */
 
 /**/
@@ -1729,6 +2176,11 @@ execpline(Estate state, wordcode slcode, int how, int last1)
 {
     int ipipe[2], opipe[2];
     int pj, newjob;
+
+    /* Keep the shell around long enough to emit command_end for the last
+     * command in `zsh -c` when recording is enabled. */
+    if (!pline_level && izsh_capture.active)
+	last1 = 0;
     int old_simple_pline = simple_pline;
     int slflags = WC_SUBLIST_FLAGS(slcode);
     wordcode code = *state->pc++;
@@ -3783,6 +4235,17 @@ execcmd_exec(Estate state, Execcmd_params eparams,
 	addfd(forked, save, mfds, 0, input, 0, NULL);
     if (output)
 	addfd(forked, save, mfds, 1, output, 1, NULL);
+
+    /* Mirror ordinary command output to the recorder while preserving the
+     * pipeline and terminal.  Explicit user redirections take precedence. */
+    if (izsh_capture.active) {
+	if (!output && !izsh_redirection_targets(redir, 1))
+	    izsh_add_stream_capture(forked, save, mfds, 1,
+				     izsh_capture.stdout_fd);
+	if (!izsh_redirection_targets(redir, 2))
+	    izsh_add_stream_capture(forked, save, mfds, 2,
+				     izsh_capture.stderr_fd);
+    }
 
     /* Do process substitutions */
     if (redir)

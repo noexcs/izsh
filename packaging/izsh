@@ -1,0 +1,29 @@
+#!/bin/sh
+
+# Launch an installed izsh build with the user's normal Zsh startup files.
+: "${IZSH_INSTALL_ROOT:=$HOME/.izsh}"
+IZSH_BINARY="$IZSH_INSTALL_ROOT/bin/zsh"
+
+if [ ! -x "$IZSH_BINARY" ]; then
+    printf '%s\n' "izsh: executable not found: $IZSH_BINARY" >&2
+    exit 127
+fi
+
+# A new launcher invocation is a new terminal session.  The timestamp keeps
+# sessions sortable; mktemp supplies the uniqueness needed for concurrent tabs.
+: "${IZSH_SESSION_ROOT:=$IZSH_INSTALL_ROOT/sessions}"
+umask 077
+if mkdir -p "$IZSH_SESSION_ROOT" 2>/dev/null; then
+    IZSH_SESSION_STAMP=$(date -u '+%Y%m%dT%H%M%SZ')
+    IZSH_SESSION_DIR=$(mktemp -d "$IZSH_SESSION_ROOT/$IZSH_SESSION_STAMP-XXXXXX" 2>/dev/null)
+fi
+
+if [ -n "${IZSH_SESSION_DIR:-}" ] && mkdir "$IZSH_SESSION_DIR/commands" 2>/dev/null; then
+    IZSH_SESSION_ID=${IZSH_SESSION_DIR##*/}
+    IZSH_EVENTS_FILE="$IZSH_SESSION_DIR/events.ndjson"
+    export IZSH_SESSION_ID IZSH_SESSION_DIR IZSH_EVENTS_FILE
+else
+    unset IZSH_SESSION_ID IZSH_SESSION_DIR IZSH_EVENTS_FILE
+fi
+
+exec "$IZSH_BINARY" "$@"
